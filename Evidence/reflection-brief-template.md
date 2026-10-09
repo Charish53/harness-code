@@ -2,98 +2,87 @@
 
 ## Environment
 
-* Name: \(REDDIPALLI SAI CHARISH\)
+* Name: REDDIPALLI SAI CHARISH
 
 * Date: October 9, 2026
 
-* Model(s): `claude-haiku-4-5-20251001` (System 1, per `summary.md`); recorded-response client with no live model calls in System 4.
+* System 1 model: `claude-haiku-4-5-20251001`
 
-* OS / Python: Linux, Python 3.13.0.
+* Environment: Linux, Python 3.13.0
 
-* Approx. API spend: Approximately $0.12 for System 1's 8-claim run (`summary.md`). System 2 used compression calls over approximately 12k and 11k token histories (`budget.json`). System 4 ran offline using `--recorded-response`, with effectively $0 API cost.
+* System 4: Recorded-response/offline mode
 
-## Part 1 — Per-system
+## Part 1 — Per-System Reflections
 
-### System 1 — Agentic loop
+### System 1 — Agentic Loop
 
-1. Loop control
+Q1. How does your loop know when to stop?
 
-The trace for `claim_01_kitchen_fire` showed the sequence `tool_use → tool_use → end_turn`. On turn 1, the model called `lookup_policy`; on turn 2, it issued several `record_claim_fact` tool calls; and on turn 3, it returned `end_turn`. Loop termination is implemented in `claims_intake/loop.py`, inside the `run()` function. After each `client.messages.create(...)` call, the code checks `response.stop_reason`: `tool_use` executes tools and continues the loop, while `end_turn` returns a `FinalState`. The test `test_stop_reason_is_loop_control` in `test_antipatterns.py` verifies that termination is based on `stop_reason`.
+The `run()` function in `claims_intake/loop.py` checks `response.stop_reason`. When it is `tool_use`, the harness executes the requested tools and continues. When it is `end_turn`, the loop returns the final state. The `claim_01_kitchen_fire` trace shows 2 turns, ending with `end_turn`. Evidence: `summary.md`, the `claim_01_kitchen_fire` trace, and `test_stop_reason_is_loop_control`.
 
-2. Anti-pattern
+Q2. Why is a hardcoded iteration limit an anti-pattern?
 
-One anti-pattern checked by `test_antipatterns.py` is the use of hardcoded iteration caps, such as `for _ in range(3)` or `while turns < 5`. The test `test_no_integer_literal_iteration_cap_in_loop` uses AST analysis to detect these constructs in `loop.py`. If a fixed cap were used, claims such as `claim_02_stolen_bike` and `claim_03_water_damage`, which required roughly five turns, could terminate before reaching `classify_claim` or `route_to_adjuster`. This would leave some claims incompletely processed. The test ensures the loop follows the model's actual `stop_reason` instead of an arbitrary turn limit.
+A fixed limit such as `for _ in range(3)` can terminate a task before the model finishes its tool calls. The run summary shows `claim_01_kitchen_fire` took 2 turns, while `claim_03_water_damage` took 4 turns. This variation demonstrates why the loop should follow `stop_reason` instead of an arbitrary cap. Evidence: `test_antipatterns.py`, `test_no_integer_literal_iteration_cap_in_loop`, and `summary.md`.
 
-3. Tool design
+Q3. How do your tool descriptions help the model?
 
-`route_to_adjuster` and `escalate_to_human` accept similar claim-summary inputs, but their descriptions distinguish when each should be used. Claims with classification confidence of at least `0.6` are routed automatically, while those below `0.6` require escalation. Structured errors from `_t_lookup_policy` include `is_error`, `error_category`, and `is_retryable`. For example, `is_retryable: false` tells the agent that repeating the same request is inappropriate, allowing it to request a corrected policy ID or escalate instead of blindly retrying. A generic error string would not reliably provide this machine-readable recovery guidance.
+The `route_to_adjuster` and `escalate_to_human` tools distinguish automatic routing from human escalation. The guidance uses a confidence threshold of 0.6: higher-confidence claims can be routed, while lower-confidence claims should be escalated. The `_t_lookup_policy` tool returns structured error fields such as `is_error`, `error_category`, and `is_retryable`, helping distinguish retryable failures from other errors. Evidence: System 1 tool definitions and tests.
 
-4. Your numbers
+Q4. What were the actual run metrics?
 
-According to `summary.md`, `claim_01_kitchen_fire` completed in 3 turns, using approximately 9,600 input tokens, 580 output tokens, and $0.0125. The more ambiguous `claim_03_water_damage` required 5 turns and cost approximately $0.021, including a clarification cycle. The additional `request_clarification` exchange increased the number of model interactions and token usage. The exact README sample figures are not available in the supplied evidence, so the numerical difference from that sample cannot be verified without the README.
+According to `summary.md`:
 
-### System 2 — Context strategy
+* `claim_01_kitchen_fire`: 2 turns, 6,372 input tokens, $0.009.
 
-5. The reduction
+* `claim_03_water_damage`: 4 turns, $0.0193, with one clarification.
 
-`budget.json` reports 38,708 baseline tokens and 16,794 assembled tokens, producing a 56.61% reduction. The `active` section dominates the assembled context at 15,789 tokens. By comparison, `case_facts` uses 204 tokens, `resolved_refund` uses 405 tokens, and `resolved_subscription` uses 414 tokens. The active section is preserved verbatim because it contains unresolved information needed for immediate reasoning. Summarizing it could remove details that affect the next decision.
+These are the submitted run's figures and replace the earlier incorrect estimates.
 
-6. Summarize vs preserve
+### System 2 — Context Strategy
 
-The system summarizes resolved historical issues and preserves active issues exactly. According to `budget.json`, the refund case was compressed from 12,334 tokens to 392 tokens, while the subscription case was compressed from 11,475 tokens to 401 tokens. Meanwhile, the active section remained intact at 15,789 tokens. This strategy reduces historical context while retaining the operational details needed for ongoing work. The evidence is in the per-section token counts in `budget.json`.
+Q5. How much context did you reduce?
 
-7. Facts block
+`budget.json` reports a baseline of 38,708 tokens and assembled context of 16,794 tokens, a 56.61% reduction. The active section remains verbatim at 15,789 tokens because it contains information needed for the current decision.
 
-Comparing `eval.jsonl` with `eval_control.jsonl`, Q6 regressed. In `eval.jsonl`, the model correctly returned `payment_update_status: in_progress`, and the evaluation passed. In `eval_control.jsonl`, the model stated that no structured status token existed, and the evaluation failed. Q1 passed in both evaluations and correctly identified the refund amount as $22.14. This demonstrates that summarization can lose structured operational facts even when straightforward narrative information remains available.
+Q6. What did you summarize and what did you preserve?
 
-### System 3 — Claude Code config
+Resolved history was compressed while the active issue was preserved:
 
-8. Path-scoped rules
+* Refund history: 12,334 → 392 tokens.
 
-The file `.claude/rules/tests.md` contains this path-scoped frontmatter:
+* Subscription history: 11,475 → 401 tokens.
 
-YAML
+* Active section: 15,789 tokens, kept verbatim.
 
-```
-paths:
-  - "**/*.test.tsx"
-  - "**/*.test.ts"
-```
+Evidence: System 2 `budget.json`.
 
-These patterns apply the rules to matching test files throughout the repository, including files in `src/components`, `src/pages`, `src/api`, and `src/db`. A directory-level `CLAUDE.md` would require more duplication to enforce the same convention across unrelated directories. The test `test_ac_02_06_test_file_matches_react_and_tests` verifies that a test file can inherit multiple rule sets simultaneously. This makes path-scoped rules useful for cross-cutting conventions.
+Q7. What happens when the persistent facts block is removed?
 
-9. Forked skill
+The full evaluation, `eval.jsonl`, reports 6/6 passing. Q1 returns the refund amount 22.14, and Q6 returns `payment_update_status: in_progress`.
 
-The deploy-check skill contains the following configuration:
+The submitted `eval_control.jsonl` was only a single byte and contained no usable evaluation results. Therefore, the Q6 regression is not yet verified by the submitted evidence. To complete this answer, rerun the control variant with the persistent facts block removed, then compare its generated results against the full evaluation.
 
-YAML
+### System 3 — Claude Code Configuration
 
-```
-context: fork
-allowed-tools:
-  - Read
-  - Grep
-  - Glob
-  - Bash(git status:*)
-  - Bash(git diff:*)
-  - Bash(git log:*)
-  - Bash(git rev-parse:*)
-  - Bash(git ls-files:*)
-  - Bash(gh pr view:*)
-  - Bash(gh pr checks:*)
-```
+Q8. Why use path-scoped rules?
 
-The `context: fork` setting isolates intermediate inspection output from the primary conversation, while the allowlist restricts the skill to reading and repository inspection. This reduces context pollution and limits the risk of accidental modifications during verification. Without forking, verbose diagnostic output could accumulate in the main context. Without the read-only tool restrictions, the skill could have access to actions beyond its verification purpose.
+`.claude/rules/tests.md` scopes its rules to `**/*.test.tsx` and `**/*.test.ts`. This applies testing guidance to matching files without repeating it in every directory. Evidence: `.claude/rules/tests.md` and the System 3 test output.
 
-10. Scope
+Q9. What does the forked deploy-check skill do?
 
-The validator completed successfully with exit code 0, according to the supplied validation summary. A project-level example is `./CLAUDE.md` and `.claude/rules/*.md`, which are committed to Git and shared with the team. A user-level example is `~/.claude/skills/deploy-check-strict/`, which exists in an individual developer's environment rather than the repository. This separates team-wide conventions from personal configuration. The validator output is the artifact supporting the successful configuration check.
+The deploy-check skill sets `context: fork` and limits `allowed-tools` to reading/searching files and selected Git/GitHub inspection commands. This keeps intermediate investigation separate from the main conversation and restricts the tools available to the skill. Evidence: the deploy-check skill configuration.
+
+Q10. What is the difference between project-level and user-level configuration?
+
+Project-level files such as `./CLAUDE.md` and `.claude/rules/*.md` can be versioned and shared with the team. A user-level skill such as `~/.claude/skills/deploy-check-strict/` belongs to an individual developer's environment. Evidence: System 3 configuration files and `validator_output.txt`.
 
 ### System 4 — Orchestration
 
-11. Push work down
+Q11. How does the SQL-filtered defect slice work?
 
-The shift-monitor output reported 3 high-severity and 2 medium-severity defects associated with capacitor bank `C-7`, all from lot `2026-0430-B`, plus one low-severity VP-4 vent squeal. The recommendation was to quarantine the lot. A subsequent execution reported `shift C: 0 new defects`. The indexed query in `shift_monitor/warm.py`, `WarmStore.defects_since()`, executes:
+The updated `shift-output.txt` now confirms `shift C: 17 new defects`. The updated `shift_scratchpad.jsonl` records the analysis window as starting at `2026-04-01T00:00:00Z`. It describes 3 high- and 2 medium-severity defects on capacitor bank C-7, associated with lot `2026-0430-B`, plus one repeat low-severity VP-4 vent squeal. The recommendation was to quarantine the affected lot.
+
+`shift_monitor/warm.py` performs the filtered retrieval in SQL:
 
 SQL
 
@@ -104,51 +93,52 @@ ORDER BY ts DESC
 LIMIT ?
 ```
 
-Filtering happens in SQLite before prompt construction, so the model receives only the relevant subset rather than the entire historical defect dataset. The test `test_gather_new_defects_has_no_python_side_filtering` verifies that filtering remains in the database layer.
+Evidence: `shift-output.txt`, `shift_scratchpad.jsonl`, and `shift_monitor/warm.py`.
 
-12. Crash recovery
+Q12. How does crash recovery decide whether to resume?
 
-`recovery.py` defines `STALE_RESUME_THRESHOLD_MINUTES = 30`. Its `decide()` function resumes work only when incomplete tasks exist and the last work occurred within the threshold; otherwise, it chooses a fresh start. The tests `test_recovery_decide_truth_table[30-False-resume]` and `test_recovery_decide_truth_table[31-False-fresh]` verify behavior at the 30- and 31-minute boundaries. A fresh start with an injected summary can be more reliable because it preserves earlier findings without blindly continuing stale reasoning. This reduces the risk of acting on outdated assumptions after a long interruption.
+`recovery.py` defines `STALE_RESUME_THRESHOLD_MINUTES = 30`. The `decide()` function resumes incomplete work if it is recent enough; stale work starts fresh. The 30- and 31-minute truth-table tests verify the boundary. Evidence: `recovery.py` and `pytest_S4.log`.
 
-13. Small state
+Q13. Why keep hot state small?
 
-The file `data/hot_state.json` measured approximately 643 bytes, according to the supplied run summary, against a reported budget of approximately 5 KB. The test `test_hotstate_rejects_more_than_20_hashes` checks that state remains bounded. Since the monitor runs once per shift indefinitely, unbounded state could increase storage use, prompt size, and recovery time over months of operation. Keeping a small snapshot makes resource usage more predictable. The exact file size and the test name provide the supporting artifacts.
+`data/hot_state.json` measures 643 bytes, according to `hot_state_size.txt`, well below the approximately 5 KB budget. The test `test_hotstate_rejects_more_than_20_hashes` checks the retained-hash limit. A small hot state avoids carrying the entire defect history into each shift. Evidence: `hot_state_size.txt` and System 4 tests.
 
-## Part 2 — Synthesis
+Q14. How does a forked investigation stay isolated?
 
-14. Three layers
+`shift_monitor/fork.py` creates a separate working state for each hypothesis. Each fork has its own scratchpad and can investigate without changing the base `hot_state.json`. The `merge_findings` operation brings results back by appending findings to the main scratchpad rather than replacing the base state with the fork's copy. This isolates exploratory work while allowing useful findings to be shared. Evidence: `shift_monitor/fork.py` and the System 4 tests.
 
-* Model: `summary.md` records the System 1 model as `claude-haiku-4-5-20251001`. The trace for `claim_01_kitchen_fire` shows the model selecting tools and eventually returning `end_turn`.
+## Part 2 — Cross-System Synthesis
 
-* Harness: `claims_intake/loop.py` and `test_antipatterns.py` define and test the execution loop. The harness interprets `stop_reason`, executes tools, and prevents unsafe control-flow shortcuts such as hardcoded iteration caps.
+Q15. Where are the Model, Harness, and Orchestration layers?
 
-* Orchestration: `shift_monitor/warm.py`, `recovery.py`, and `data/hot_state.json` manage retrieval, recovery, and persistent state. The indexed `defects_since()` query limits retrieved history, while the 30-minute threshold determines whether work resumes or restarts.
+* Model: System 1 uses `claude-haiku-4-5-20251001`, recorded in `summary.md`.
 
-Together, these artifacts show three separate responsibilities: the model decides what to do next, the harness controls how tool calls execute, and orchestration manages work and state across runs.
+* Harness: `claims_intake/loop.py` interprets `stop_reason` and executes tool calls.
 
-15. Deterministic vs prompt
+* Orchestration: System 4 uses `warm.py`, `recovery.py`, and `fork.py` to manage filtered retrieval, recovery, and isolated investigations.
 
-A deterministic behavior is the recovery decision in `recovery.py`: the 30-minute threshold is enforced by code and tested at the boundary. Another is the read-only `allowed-tools` list in `.claude/skills/deploy-check/SKILL.md`, which restricts verification actions. By contrast, tool descriptions in System 1 guide the model toward `route_to_adjuster` or `escalate_to_human` according to claim confidence. Code enforcement is appropriate for safety-critical boundaries and invariants; prompts and descriptions are appropriate for semantic decisions that require interpreting context. The distinction is supported by `test_recovery_decide_truth_table[30-False-resume]` and the deploy-check skill configuration.
+The model chooses actions, the harness executes the interaction, and orchestration manages state across runs.
 
-16. Context, two faces
+Q16. What is the difference between deterministic enforcement and prompt guidance?
 
-System 2 manages context within a session: `budget.json` reduces the baseline from 38,708 to 16,794 tokens, a 56.61% reduction, while preserving the active section at 15,789 tokens. System 4 manages context across shifts: `data/hot_state.json` is approximately 643 bytes, and `recovery.py` uses a 30-minute staleness threshold to choose between resuming and starting fresh. Both systems preserve essential information while avoiding unnecessary history. System 2 uses summarization and selective verbatim preservation; System 4 uses indexed retrieval, compact persistent state, and recovery rules. These mechanisms address different time scales but share the same principle: retain relevant state, not the entire history.
+System 4's 30-minute recovery threshold is deterministic code behavior tested at the 30- and 31-minute boundaries. System 1's tool descriptions guide the model in choosing between adjuster routing and human escalation. I would enforce hard safety boundaries in code and use prompt/tool descriptions for decisions requiring contextual interpretation. Evidence: `recovery.py`, System 4 tests, and System 1 tool definitions.
 
-17. Reliability you can't see in one run
+Q17. How does context management differ between Systems 2 and 4?
 
-The test `test_no_integer_literal_iteration_cap_in_loop` checks that `claims_intake/loop.py` does not use hardcoded iteration limits. A single successful claim run would not prove that the loop can handle longer or more complex claims without being cut off by an arbitrary cap. Similarly, `test_recovery_decide_truth_table[31-False-fresh]` verifies that work older than the staleness threshold starts fresh. These tests matter before shipping because edge cases and interrupted runs may not appear in a normal demonstration. The named tests provide evidence that these behaviors are checked explicitly.
+System 2 reduces context from 38,708 to 16,794 tokens, a 56.61% reduction. System 4 keeps hot state to 643 bytes and uses a 30-minute threshold to decide whether to resume. System 2 compresses long conversation history; System 4 uses SQL-filtered retrieval and compact persisted state across shifts. Evidence: `budget.json`, `hot_state_size.txt`, and `recovery.py`.
 
-18. Blast radius
+Q18. Why are tests important beyond a successful run?
 
-For System 4, an orchestration failure could affect defect reporting and lot-quarantine recommendations for a production shift. The enforcement points include the indexed query in `shift_monitor/warm.py`, the resume-versus-fresh decision in `recovery.py`, and the bounded state in `data/hot_state.json`. If retrieval included excessive history or recovery reused stale work, the monitor could produce outdated or misleading recommendations. A safe operational kill switch would be to disable scheduled monitor execution and require manual review until the issue is resolved. The supplied artifacts do not identify a built-in kill-switch command, so this is a proposed operational safeguard rather than a verified existing feature.
+A successful trace only demonstrates one execution path. `test_no_integer_literal_iteration_cap_in_loop` checks that the agent loop does not rely on a hardcoded iteration limit. System 4's 30- and 31-minute recovery tests exercise the boundary between resuming and starting fresh. These tests cover failure conditions that may not appear in a normal run. Evidence: System 1 anti-pattern tests and `pytest_S4.log`.
 
-## Part 3 — Honest assessment
+Q19. What is the potential blast radius of an orchestration failure?
 
-19. What broke
+An incorrect SQL time window could omit defects and lead to an incomplete shift summary. Resuming stale work could produce decisions based on outdated state. SQL filtering in `warm.py`, the recovery threshold in `recovery.py`, compact hot state, and fork isolation reduce these risks. A further safeguard would be to pause scheduled runs and request manual review if state validation or retrieval checks fail.
 
-The supplied setup notes report an `httpx` compatibility error: `Client.__init__() got an unexpected keyword argument 'proxies'`. A separate environment also required a newer Anthropic SDK to support `messages.count_tokens`. These issues were resolved by selecting compatible package versions. The experience indicates that dependency compatibility can break a project before its application logic is exercised. The recorded exception and the dependency-version fix are the available evidence; the supplied notes do not include the exact package lockfile or installation command.
+## Part 3 — Honest Assessment
 
-20. What you'd change
+Q20. What broke, and what would you improve?
 
-I would introduce fully pinned dependency versions or lockfiles for each system rather than relying on transitive dependency resolution. The setup failures included `Client.__init__() got an unexpected keyword argument 'proxies'` and an Anthropic SDK version that did not support `messages.count_tokens`. Both issues required selecting compatible package versions. Separate lockfiles and documented setup commands would make the environment reproducible and reduce onboarding time. The evidence comes from the recorded setup failures in the supplied project notes.
+The initial shift output reported `0 new defects`, even though the recorded response described a defect cluster. After rerunning, the updated `shift-output.txt` reported 17 new defects, and the scratchpad recorded the investigation window and findings. The submitted `eval_control.jsonl` also contained no usable evaluation results, so that control comparison still needs to be regenerated.
 
+I would automate evidence generation so the workflow seeds fixtures, runs the shift, executes both full and control evaluations, validates JSONL contents, and saves the actual outputs. I would also pin dependencies and document setup commands to make the environment reproducible.
